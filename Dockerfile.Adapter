@@ -1,7 +1,10 @@
-FROM python:3.11-slim
+FROM python:3.13-slim
 
 LABEL maintainer="k8s-metrix <abbas.jafari@powercoders.org>"
 RUN apt-get update -y && apt-get upgrade -y
+# Cache-busting step to ensure subsequent layers are never cached
+ARG CACHEBUST=1
+RUN echo "Cache bust: $CACHEBUST"
 
 COPY src/ /app/src/
 COPY pyproject.toml /app/
@@ -13,6 +16,14 @@ RUN pip install .
 RUN pip install fastapi uvicorn[standard] rich
 ENV TLS_KEY_PATH="/etc/ssl/certs/k8s-metrix/tls.key"
 ENV TLS_CERT_PATH="/etc/ssl/certs/k8s-metrix/tls.crt"
+RUN groupadd --system --gid 1000 metrix-system && \
+    useradd --system --uid 1000 --gid 1000 --home-dir /home/metrix-system --create-home metrix-system && \
+    mkdir -p /home/metrix-system /app/metrics && \
+    chown -R metrix-system:metrix-system /home/metrix-system && \
+    chown -R metrix-system:metrix-system /app/
+
+USER metrix-system
+
 
 EXPOSE 8000
 ENTRYPOINT ["sh", "-c", "uvicorn k8s_metrix.adapter.main:app --host 0.0.0.0 --port 8000 --ssl-keyfile $TLS_KEY_PATH --ssl-certfile $TLS_CERT_PATH"]

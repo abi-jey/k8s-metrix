@@ -67,11 +67,9 @@ class K8sMetrix:
         The main loop of the K8sMetrix instance.
         """
         while True:
-            metrics = self.expose_metrics()
-            logger.info(f"Exposing metrics: {metrics}")
             await sleep(5)
 
-    def add_metric(self, name: str, value: int):
+    async def add_metric(self, name: str, value: int, additional_info: Optional[Dict[str, str]] = None):
         """
         Add custom metrics to the K8sMetrix instance.
 
@@ -83,11 +81,15 @@ class K8sMetrix:
             raise ValueError("Value must be an integer.")
         value = int(value)
         logger.debug(f"[k8s-metrix]: Adding metric: {name}:{value}")
+        if self.backend == "fs" and isinstance(self.backend, FsBackend):
+            await self.backend.record(name, value)
+        else:
+            raise NotImplementedError("Backend not implemented.")
 
     async def init_backend(self):
         if self.backend == "fs":
-            self.backend = FsBackend()
-            await self.backend.start()
+            self._backend = FsBackend()
+            await self._backend.start()
             logger.debug(f"[k8s-metrix]: Initialized FsBackend.")
 
     async def all_metrics(self) -> List[str]:
@@ -97,11 +99,10 @@ class K8sMetrix:
         Returns:
             dict: A dictionary containing all metrics.
         """
-        if self.backend == "fs":
-            if isinstance(self.backend, FsBackend):
-                return await self.backend.list_all_metrics()
-            else:
-                raise NotImplementedError("FsBackend not initialized properly.")
+        if isinstance(self._backend, FsBackend):
+            metrics = await self._backend.list_all_metrics()
+            logger.debug(f"[k8s-metrix]: Retrieved all metrics: {metrics}")
+            return metrics
         else:
             raise NotImplementedError("Backend not implemented.")
 

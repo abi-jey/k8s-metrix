@@ -9,7 +9,7 @@ class BaseBackend(ABC):
     """
 
     @abstractmethod
-    async def record(self, name: str, value: int) -> None:
+    async def record(self, name: str, value: int, service: str = "", pod: str = "", namespace: str = "") -> None:
         """
         Record a metric with the given name and value.
         Args:
@@ -20,7 +20,7 @@ class BaseBackend(ABC):
 
 
     @abstractmethod
-    async def retrieve(self, name: str) -> List[Tuple[datetime, int]]:
+    async def retrieve(self, name: str, service: str = "", pod: str = "", namespace: str = "") -> List[Tuple[datetime, int]]:
         """
         Retrieve a metric by its name.
         Args:
