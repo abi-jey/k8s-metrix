@@ -1,0 +1,32 @@
+[project]
+name = "k8s-metrix"
+version = "0.1.1a10"
+description = ""
+authors = [
+    {name = "abi_jey",email = "abi-jey@users.noreply.github.com"}
+]
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "pydantic (>=2.1.0,<3.0.0)",
+    "cryptography>=41.0.0"
+]
+
+[tool.poetry]
+packages = [
+    {include = "k8s_metrix",from = "src"}
+]
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry.group.dev.dependencies]
+pytest = ">=8.0.0"
+fastapi = "*"
+uvicorn = "*"
+pre-commit = "*"
+websockets = "^15.0.1"
+kubernetes = ">=28.1.0"
+rich = "^14.0.0"
+

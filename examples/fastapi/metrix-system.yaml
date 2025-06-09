@@ -1,0 +1,78 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: metrix-system
+  annotations:
+    scheduler.alpha.kubernetes.io/defaultTolerations: '[{"operator":"Exists", "effect":"NoSchedule"}]'
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: metrix-system
+  namespace: metrix-system
+  labels:
+    app: metrix-system
+spec:
+  selector:
+    matchLabels:
+      app: metrix-system
+  template:
+    metadata:
+      labels:
+        app: metrix-system
+    spec:
+      containers:
+      - name: metrix-adapter
+        image: ghcr.io/abi-jey/k8s-metrix/metrix-adapter:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8000
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "250m"
+          limits:
+            memory: "128Mi"
+            cpu: "500m"
+        volumeMounts:
+        - name: tls-certs
+          mountPath: /etc/ssl/certs/k8s-metrix
+          readOnly: true
+        env:
+        - name: TLS_CERT_PATH
+          value: "/etc/ssl/certs/k8s-metrix/tls.crt"
+        - name: TLS_KEY_PATH
+          value: "/etc/ssl/certs/k8s-metrix/tls.key"
+      volumes:
+      - name: tls-certs
+        secret:
+          secretName: k8s-metrix-tls-secret
+          defaultMode: 0600  # Read-only for owner only
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: metrix-system-service
+  namespace: metrix-system
+spec:
+  selector:
+    app: metrix-system
+  ports:
+  - port: 8000
+    targetPort: 8000
+  type: ClusterIP
+---
+apiVersion: apiregistration.k8s.io/v1
+kind: APIService
+metadata:
+  name: v1beta2.custom.metrics.k8s.io
+spec:
+  service:
+    name: metrix-system-service
+    namespace: metrix-system
+    port: 8000
+  group: custom.metrics.k8s.io
+  version: v1beta2
+  insecureSkipTLSVerify: true
+  groupPriorityMinimum: 100
+  versionPriority: 100

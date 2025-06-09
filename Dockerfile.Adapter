@@ -1,0 +1,18 @@
+FROM python:3.11-slim
+
+LABEL maintainer="k8s-metrix <abbas.jafari@powercoders.org>"
+RUN apt-get update -y && apt-get upgrade -y
+
+COPY src/ /app/src/
+COPY pyproject.toml /app/
+COPY README.md /app/
+
+
+WORKDIR /app
+RUN pip install .
+RUN pip install fastapi uvicorn[standard] rich
+ENV TLS_KEY_PATH="/etc/ssl/certs/k8s-metrix/tls.key"
+ENV TLS_CERT_PATH="/etc/ssl/certs/k8s-metrix/tls.crt"
+
+EXPOSE 8000
+ENTRYPOINT ["sh", "-c", "uvicorn k8s_metrix.adapter.main:app --host 0.0.0.0 --port 8000 --ssl-keyfile $TLS_KEY_PATH --ssl-certfile $TLS_CERT_PATH"]
