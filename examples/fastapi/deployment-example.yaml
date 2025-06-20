@@ -1,0 +1,123 @@
+---
+# Namespace for the example application
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: k8s-metrix-example
+  annotations:
+    scheduler.alpha.kubernetes.io/defaultTolerations: '[{"operator":"Exists", "effect":"NoSchedule"}]'
+
+---
+# Service for the FastAPI application
+apiVersion: v1
+kind: Service
+metadata:
+  name: k8s-metrix-example
+  namespace: k8s-metrix-example
+  labels:
+    app: k8s-metrix-example
+spec:
+  selector:
+    app: k8s-metrix-example
+  ports:
+  - name: http
+    port: 8000
+    targetPort: 8000
+    protocol: TCP
+  type: ClusterIP
+---
+# Deployment for the FastAPI application with K8sMetrix client
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: k8s-metrix-example
+  namespace: k8s-metrix-example
+  labels:
+    app: k8s-metrix-example
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: k8s-metrix-example
+  template:
+    metadata:
+      labels:
+        app: k8s-metrix-example
+    spec:
+      containers:
+      - name: fastapi-app
+        image: ghcr.io/abi-jey/k8s-metrix/example-fastapi:latest
+        imagePullPolicy: Always
+        ports:
+        - name: http
+          containerPort: 8000
+        env:
+        - name: SERVICE_NAME
+          value: "k8s-metrix-example"
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /api/health
+            port: http
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /api/health
+            port: http
+          initialDelaySeconds: 5
+          periodSeconds: 5
+
+---
+# Horizontal Pod Autoscaler for the FastAPI application
+# Scales based on custom metric "request_per_second" with target of 5 requests per pod
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: k8s-metrix-example-hpa
+  namespace: k8s-metrix-example
+  labels:
+    app: k8s-metrix-example
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: k8s-metrix-example
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+  - type: Pods
+    pods:
+      metric:
+        name: requests_per_second
+      target:
+        type: AverageValue
+        averageValue: "5"
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+      - type: Percent
+        value: 100
+        periodSeconds: 15
+      - type: Pods
+        value: 2
+        periodSeconds: 60
+      selectPolicy: Max
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+      - type: Percent
+        value: 10
+        periodSeconds: 60
+      - type: Pods
+        value: 1
+        periodSeconds: 300
+      selectPolicy: Min
+

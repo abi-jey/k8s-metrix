@@ -1,5 +1,6 @@
 from k8s_metrix.backends.base import BaseBackend
 import os
+from pathlib import Path
 from typing import List, Dict, Tuple
 from typing import Set
 from datetime import datetime
@@ -48,7 +49,7 @@ class FsBackend(BaseBackend):
         await self.init_backend()
         logger.debug(f"[k8s-metrix]: FsBackend startup complete")
 
-    async def record(self, name: str, value: int, service: str = "", pod: str = "", namespace: str = ""):
+    async def record(self, name: str, value: float, service: str = "", pod: str = "", namespace: str = ""):
         """
         Record a metric with the given name and value.
 
@@ -59,19 +60,21 @@ class FsBackend(BaseBackend):
             pod (str): The pod name (optional).
             namespace (str): The namespace (optional).
         """
+        base_path = Path(self.path)
+        
         # Determine the metric path based on whether it's for a service or pod
-        if service and namespace:
-            # Format: service/namespace/service_name/metric_name/
-            metric_path = os.path.join(self.path, "service", namespace, service, name)
-        elif pod and namespace:
+        if pod and namespace:
             # Format: pod/namespace/pod_name/metric_name/
-            metric_path = os.path.join(self.path, "pod", namespace, pod, name)
+            metric_path = base_path / "pod" / namespace / pod / name
+        elif service and namespace:
+            # Format: service/namespace/service_name/metric_name/
+            metric_path = base_path / "service" / namespace / service / name
         else:
             # Fallback to structured format for backward compatibility
-            metric_path = os.path.join(self.path, "no_resource_type", "no_namespace", "no_instance", name)
+            metric_path = base_path / "no_resource_type" / "no_namespace" / "no_instance" / name
         
         # Create the directory structure if it doesn't exist
-        os.makedirs(metric_path, exist_ok=True)
+        metric_path.mkdir(parents=True, exist_ok=True)
         
         # Add to metrics set for tracking
         if service and namespace:
@@ -83,55 +86,101 @@ class FsBackend(BaseBackend):
         self.metrics.add(metric_key)
 
         timestamp = datetime.now().isoformat()
-        metric_file = os.path.join(metric_path, "records.txt")
-        with open(metric_file, 'a') as f:
+        metric_file = metric_path / "records.txt"
+        with metric_file.open('a') as f:
             f.write(f"{timestamp}:{value}\n")
 
-    def init_path(self):
+    async def get_metric_value(self, name: str, service: str = "", pod: str = "", namespace: str = "") -> int:
         """
-        Initialize the path for storing metrics.
-        """
-        path = os.path.abspath(self.path)
-        if not os.path.exists(path):
-            os.makedirs(path)
-        if not os.path.isdir(path):
-            raise ValueError(f"Path {path} is not a directory, please provide a remove or select a different path.")
-        if not os.access(path, os.W_OK):
-            raise ValueError(f"Path {path} is not writable, make sure user {os.getuid()} has write permissions.")
-        logger.debug(f"[k8s-metrix]: Path initialized: {path}")
-        self.path = path
-
-    async def retrieve(self, name: str, service: str = "", pod: str = "", namespace: str = "") -> List[Tuple[datetime, int]]:
-        """
-        Retrieve a metric by its name.
+        Get the latest value of a metric by its name.
+        
         Args:
             name (str): The name of the metric.
             service (str): The service name (optional).
             pod (str): The pod name (optional).
             namespace (str): The namespace (optional).
+        
         Returns:
-            List[Tuple[datetime, int]]: A list of tuples containing the metric's timestamps and values.
+            int: The latest value of the metric, or None if not found.
         """
-        # Determine the metric path based on whether it's for a service or pod
-        if service and namespace:
-            # Format: service/namespace/service_name/metric_name/
-            metric_file = os.path.join(self.path, "service", namespace, service, name, "records.txt")
-        elif pod and namespace:
-            # Format: pod/namespace/pod_name/metric_name/
-            metric_file = os.path.join(self.path, "pod", namespace, pod, name, "records.txt")
+        records_dict = await self.retrieve(name, service, pod, namespace)
+        
+        # Get the latest record from any resource
+        latest_value = None
+        latest_timestamp = None
+        
+        for resource_name, records in records_dict.items():
+            if records:
+                # Get the latest record for this resource
+                latest_record = records[-1]
+                if latest_timestamp is None or latest_record[0] > latest_timestamp:
+                    latest_timestamp = latest_record[0]
+                    latest_value = latest_record[1]
+        
+        return latest_value if latest_value is not None else 0
+
+    def init_path(self):
+        """
+        Initialize the path for storing metrics.
+        """
+        path = Path(self.path).resolve()
+        if not path.exists():
+            path.mkdir(parents=True, exist_ok=True)
+        if not path.is_dir():
+            raise ValueError(f"Path {path} is not a directory, please provide a remove or select a different path.")  # fmt: skip
+        if not os.access(path, os.W_OK):
+            raise ValueError(f"Path {path} is not writable, make sure user {os.getuid()} has write permissions.")  # fmt: skip
+        logger.debug(f"[k8s-metrix]: Path initialized: {path}")
+        self.path = str(path)
+
+    async def retrieve(self, name: str, service: str = "", pod: str = "", namespace: str = "") -> Dict[str, List[Tuple[datetime, int]]]:
+        """
+        Retrieve a metric by its name with wildcard support.
+        Args:
+            name (str): The name of the metric.
+            service (str): The service name (optional), can be wildcarded with "*".
+            pod (str): The pod name (optional), can be wildcarded with "*".
+            namespace (str): The namespace (optional).
+        Returns:
+            Dict[str, List[Tuple[datetime, int]]]: A dictionary with resource names as keys and 
+                                                   lists of metric records as values.
+        """
+        result = {}
+        base_path = Path(self.path)
+        
+        if pod and namespace:
+            # Find all pods across all services
+            pod_base = base_path / "pod" / namespace
+            if pod_base.exists():
+                if pod == "*":
+                    dirs = list(pod_base.glob("*"))
+                else:
+                    dirs = [pod_base / pod]
+                for pod_dir in dirs:
+                    if pod_dir.is_dir():
+                        records = self._read_metric_file(pod_dir / name / "records.txt")
+                        if records:
+                            result[pod_dir.name] = records
+        elif service and namespace:
+            # Handle service metrics - check if there are service-level metrics
+            service_base = base_path / "service" / namespace
+            if service == "*":
+                dirs = list(service_base.glob("*"))
+            else:
+                dirs = [service_base / service]
+            for service_dir in dirs:
+                if service_dir.is_dir():
+                    records = self._read_metric_file(service_dir / name / "records.txt")
+                    if records:
+                        result[service_dir.name] = records
         else:
             # Fallback to structured format for backward compatibility
-            metric_file = os.path.join(self.path, "no_resource_type", "no_namespace", "no_instance", name, "records.txt")
-            
-        if not os.path.exists(metric_file):
-            return []
-
-        records = []
-        with open(metric_file, 'r') as f:
-            for line in f:
-                timestamp, value = line.strip().split(':', maxsplit=1)
-                records.append((datetime.fromisoformat(timestamp), int(value)))
-        return records
+            fallback_path = base_path / "no_resource_type" / "no_namespace" / "no_instance" / name / "records.txt"
+            records = self._read_metric_file(fallback_path)
+            if records:
+                result["no_instance"] = records
+                    
+        return result
     
     async def list_all_metrics(self) -> List[str]:
         """
@@ -212,44 +261,65 @@ class FsBackend(BaseBackend):
         Load existing metrics from the filesystem into the metrics set.
         This is called once on the first list operation to populate the cache.
         """
-        if not os.path.exists(self.path):
+        base_path = Path(self.path)
+        if not base_path.exists():
             return
         
         # Check for fallback structure (no_resource_type/no_namespace/no_instance)
-        fallback_path = os.path.join(self.path, "no_resource_type", "no_namespace", "no_instance")
-        if os.path.exists(fallback_path):
-            for metric in os.listdir(fallback_path):
-                metric_path = os.path.join(fallback_path, metric)
-                if os.path.isdir(metric_path):
-                    self.metrics.add(f"no_resource_type/no_namespace/no_instance/{metric}")
+        fallback_path = base_path / "no_resource_type" / "no_namespace" / "no_instance"
+        if fallback_path.exists():
+            for metric_dir in fallback_path.iterdir():
+                if metric_dir.is_dir():
+                    self.metrics.add(f"no_resource_type/no_namespace/no_instance/{metric_dir.name}")
         
         # Check for service structure
-        service_path = os.path.join(self.path, "service")
-        if os.path.exists(service_path):
-            for namespace in os.listdir(service_path):
-                namespace_path = os.path.join(service_path, namespace)
-                if os.path.isdir(namespace_path):
-                    for service_name in os.listdir(namespace_path):
-                        service_dir = os.path.join(namespace_path, service_name)
-                        if os.path.isdir(service_dir):
-                            for metric in os.listdir(service_dir):
-                                metric_path = os.path.join(service_dir, metric)
-                                if os.path.isdir(metric_path):
-                                    self.metrics.add(f"service/{namespace}/{service_name}/{metric}")
+        service_path = base_path / "service"
+        if service_path.exists():
+            for namespace_dir in service_path.iterdir():
+                if namespace_dir.is_dir():
+                    for service_dir in namespace_dir.iterdir():
+                        if service_dir.is_dir():
+                            for metric_dir in service_dir.iterdir():
+                                if metric_dir.is_dir():
+                                    metric_key = f"service/{namespace_dir.name}/{service_dir.name}/{metric_dir.name}"  # fmt: skip
+                                    self.metrics.add(metric_key)
         
         # Check for pod structure
-        pod_path = os.path.join(self.path, "pod")
-        if os.path.exists(pod_path):
-            for namespace in os.listdir(pod_path):
-                namespace_path = os.path.join(pod_path, namespace)
-                if os.path.isdir(namespace_path):
-                    for pod_name in os.listdir(namespace_path):
-                        pod_dir = os.path.join(namespace_path, pod_name)
-                        if os.path.isdir(pod_dir):
-                            for metric in os.listdir(pod_dir):
-                                metric_path = os.path.join(pod_dir, metric)
-                                if os.path.isdir(metric_path):
-                                    self.metrics.add(f"pod/{namespace}/{pod_name}/{metric}")
+        pod_path = base_path / "pod"
+        if pod_path.exists():
+            for namespace_dir in pod_path.iterdir():
+                if namespace_dir.is_dir():
+                    for pod_dir in namespace_dir.iterdir():
+                        if pod_dir.is_dir():
+                            for metric_dir in pod_dir.iterdir():
+                                if metric_dir.is_dir():
+                                    metric_key = f"pod/{namespace_dir.name}/{pod_dir.name}/{metric_dir.name}"  # fmt: skip
+                                    self.metrics.add(metric_key)
         
         logger.debug(f"[k8s-metrix]: Loaded {len(self.metrics)} metrics from filesystem")
+
+    def _read_metric_file(self, metric_file_path: Path) -> List[Tuple[datetime, int]]:
+        """
+        Read metric records from a metric file.
+        Args:
+            metric_file_path (Path): The path to the metric file.
+        Returns:
+            List[Tuple[datetime, int]]: A list of metric records.
+        """
+        if not metric_file_path.exists():
+            return []
+
+        records = []
+        try:
+            with metric_file_path.open('r') as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        timestamp_str, value_str = line.rsplit(':', 1)
+                        records.append((datetime.fromisoformat(timestamp_str), float(value_str)))
+        except (ValueError, OSError) as e:
+            logger.error(f"Error reading metric file {metric_file_path}: {e}")
+            return []
+        
+        return records
 

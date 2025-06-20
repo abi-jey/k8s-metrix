@@ -11,7 +11,8 @@ from rich.logging import RichHandler
 
 logging.basicConfig(level=logging.DEBUG, format="%(message)s", datefmt="[%X]", handlers=[RichHandler()])
 
-metrix = K8sMetrix(backend="fs")
+# Initialize K8sMetrix in client mode to send metrics to the adapter
+metrix = K8sMetrix()
 lsm = LifeSpanManager(metrix)
 app = FastAPI(docs_url="/", lifespan=lsm)
 configure(app, metrix)
@@ -38,17 +39,27 @@ async def some_lifespan_function(app: FastAPI):
 lsm.register(some_lifespan_function)
 
 @app.get("/api")
-def read_root():
+async def read_root():
     return {"Hello": "World"}
 
+@app.get("/api/health")
+async def health_check():
+    return {"status": "healthy"}
+
+WEBSOCKET_CONNECTIONS = 0
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
-    await ws.accept()
-    while True:
-        data = await ws.receive_text()
-        await ws.send_text(f"Message text was: {data}")
-
-
+    await ws.accept()    
+    try:
+        while True:
+            global WEBSOCKET_CONNECTIONS
+            WEBSOCKET_CONNECTIONS += 1
+            # Record websocket connection
+            await metrix.add_metric("websocket_connections", WEBSOCKET_CONNECTIONS)
+            data = await ws.receive_text()
+            await ws.send_text(f"Message text was: {data}")
+    except Exception:
+        raise
 
 
 if __name__ == "__main__":

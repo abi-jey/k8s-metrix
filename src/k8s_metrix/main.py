@@ -6,9 +6,14 @@ from logging import getLogger
 from asyncio import sleep
 from asyncio import create_task
 from asyncio import Task
+from asyncio import Queue
 import base64
 import tempfile
 import os
+import json
+from datetime import datetime
+import aiohttp
+import ssl
 from cryptography import x509
 from cryptography.x509.oid import NameOID
 from cryptography.hazmat.primitives import hashes
@@ -25,86 +30,184 @@ from k8s_metrix.backends import FsBackend
 logger = getLogger(__name__)
 
 class K8sMetrix:
-    def __init__(self, backend: Literal["fs", "redis"]):
+    def __init__(
+            self,
+            *,
+            adapter_url: str = "",
+            backend: Literal["fs", "redis"] = "fs",
+            service_name: str = "",
+            ) -> None:
         """
         Initialize the K8sMetrix instance.
 
         Args:
-            backend (Literal["fs", "redis"]): The backend to use for storing metrics. Defaults to "fs".
+            adapter_url (str): URL of the metrix-adapter endpoint. Defaults to "http://localhost:8000".
+            backend (str): Backend type for metrics storage. Defaults to "fs".
+            service_name (str): Name of the service. If not provided, reads from SERVICE_NAME env var.
         """
-        self.backend = backend
+        default_adapter_url = "https://metrix-system-service.metrix-system.svc.cluster.local:8000"
+        self.adapter_url = adapter_url if adapter_url else default_adapter_url
 
         self.loop: Optional[Task] = None
+        self._metrics_queue: Queue = Queue()
+        self.backend = backend
+        self._http_session: aiohttp.ClientSession = self._create_http_session()
+        self.pod_name = os.getenv('HOSTNAME', 'unknown-pod')
+        self.pod_namespace = self._get_pod_namespace()
+        self.node_name = os.getenv('NODE_NAME', 'unknown-node')
+        self.service_name = service_name if service_name else os.getenv('SERVICE_NAME', 'unknown-service')
 
-    def expose_metrics(self) -> Dict[str, List[Dict[str, str | int]]]:
-        """
-        Expose metrics in a format that can be consumed by monitoring systems.
+    def _get_pod_namespace(self) -> str:
+        """Read the pod namespace from the Kubernetes service account file."""
+        try:
+            with open('/var/run/secrets/kubernetes.io/serviceaccount/namespace', 'r') as f:
+                logger.debug("[k8s-metrix]: Reading pod namespace from service account file")
+                return f.read().strip()
+        except (FileNotFoundError, IOError, PermissionError) as e:
+            logger.warning(f"Failed to read namespace from service account file: {e}")
+            return 'default'
 
-        Returns:
-            dict: A dictionary containing the metrics.
-        """
-        return {
-            "metrics": [
-                {"name": "cpu_usage", "value": 50},
-                {"name": "memory_usage", "value": 1024}
-            ]
-        }
+    def _create_http_session(self) -> aiohttp.ClientSession:
+        """Create an HTTP session with SSL verification disabled."""
+        ssl_context = ssl.create_default_context()
+        ssl_context.check_hostname = False
+        ssl_context.verify_mode = ssl.CERT_NONE
+        connector = aiohttp.TCPConnector(ssl=ssl_context)
+        return aiohttp.ClientSession(connector=connector)
+
 
     async def start(self):
         """
         Start the K8sMetrix instance.
-
-        This method is a placeholder and should be implemented in subclasses.
         """
-        logger.debug(f"[k8s-metrix]: Starting K8sMetrix with backend: {self.backend}")
-        await self.init_backend()
+        logger.debug(f"[k8s-metrix]: Starting K8sMetrix with adapter URL: {self.adapter_url}")
+    
+        self._metrics_queue = Queue()
+        self._http_session = self._create_http_session()
+        logger.debug(f"[k8s-metrix]: Client mode - connecting to adapter at {self.adapter_url}")
+        logger.debug(f"[k8s-metrix]: Pod info - name: {self.pod_name}, namespace: {self.pod_namespace}, "
+                        f"service: {self.service_name}, node: {self.node_name}")  # fmt: skip
         self.loop = create_task(self._daemon())
         logger.debug(f"[k8s-metrix]: K8sMetrix startup complete.")
+
+    async def stop(self):
+        """
+        Stop the K8sMetrix instance and cleanup resources.
+        """
+        if self.loop:
+            self.loop.cancel()
+            try:
+                await self.loop
+            except asyncio.CancelledError:
+                pass  # Expected when cancelling
+            except Exception as e:
+                logger.debug(f"[k8s-metrix]: Error stopping daemon: {e}")
+        
+        if self._http_session:
+            await self._http_session.close()
+        
+        logger.debug("[k8s-metrix]: K8sMetrix stopped.")
 
 
     async def _daemon(self):
         """
         The main loop of the K8sMetrix instance.
         """
+        await self._client_daemon()
+
+    async def _client_daemon(self):
+        """
+        Client daemon loop that sends queued metrics to the adapter.
+        """
+        while True:
+            try:
+                if not self._metrics_queue.empty():
+                    # Collect all queued metrics
+                    metrics_batch = []
+                    while not self._metrics_queue.empty():
+                        try:
+                            metric = await self._metrics_queue.get()
+                            metrics_batch.append(metric)
+                        except Exception:
+                            break
+                    
+                    if metrics_batch:
+                        await self._send_metrics_to_adapter(metrics_batch)
+                
+                await sleep(5)
+                logger.debug(f"[k8s-metrix]: Client daemon running. Queue size: {self._metrics_queue.qsize()}")
+            except Exception as e:
+                logger.error(f"[k8s-metrix]: Error in client daemon: {e}")
+                await sleep(5)
+
+    async def _server_daemon(self):
+        """
+        Server daemon loop for backend operations.
+        """
         while True:
             await sleep(5)
 
-    async def add_metric(self, name: str, value: int, additional_info: Optional[Dict[str, str]] = None):
+    async def _send_metrics_to_adapter(self, metrics_batch: List[Dict]):
+        """
+        Send a batch of metrics to the adapter endpoint.
+        """
+        try:
+            payload = {
+                "pod_name": self.pod_name,
+                "pod_namespace": self.pod_namespace,
+                "service_name": self.service_name,
+                "node_name": self.node_name,
+                "metrics": metrics_batch,
+                "timestamp": datetime.now().isoformat()
+            }
+            
+            async with self._http_session.post(
+                f"{self.adapter_url}/metrics",
+                json=payload,
+                headers={"Content-Type": "application/json"}
+            ) as response:
+                if response.status == 200:
+                    logger.debug(f"[k8s-metrix]: Successfully sent {len(metrics_batch)} metrics to adapter")
+                else:
+                    logger.error(f"[k8s-metrix]: Failed to send metrics to adapter. Status: {response.status}, "
+                               f"Response: {await response.text()}")  # fmt: skip
+        except Exception as e:
+            logger.error(f"[k8s-metrix]: Error sending metrics to adapter: {e}")
+
+    async def add_metric(self, name: str, value: int, additional_info: Optional[Dict[str, str]] = None, 
+                        metric_type: str = "gauge"):
         """
         Add custom metrics to the K8sMetrix instance.
 
         Args:
             name (str): The name of the metric.
             value (int): The value of the metric.
+            additional_info (Optional[Dict[str, str]]): Additional metadata for the metric.
+            metric_type (str): Type of metric. "counter" for rate-based metrics that will be 
+                             averaged and saved as "{metric_name}_per_second", "gauge" for 
+                             cumulative metrics like live connections (default).
         """
         if not isinstance(value, int):
             raise ValueError("Value must be an integer.")
         value = int(value)
-        logger.debug(f"[k8s-metrix]: Adding metric: {name}:{value}")
-        if self.backend == "fs" and isinstance(self.backend, FsBackend):
-            await self.backend.record(name, value)
-        else:
-            raise NotImplementedError("Backend not implemented.")
+        
+        if metric_type not in ["counter", "gauge"]:
+            raise ValueError("metric_type must be either 'counter' or 'gauge'")
+        
+        metric_data = {
+            "name": name,
+            "value": value,
+            "timestamp": datetime.now().isoformat(),
+            "metric_type": metric_type,
+            "additional_info": additional_info or {}
+        }
+        
+        logger.debug(f"[k8s-metrix]: Adding metric: {name}:{value} (type: {metric_type})")
+        await self._metrics_queue.put(metric_data)
+        logger.debug(f"[k8s-metrix]: Metric {name} added to queue. Current queue size: "
+                    f"{self._metrics_queue.qsize()}")  # fmt: skip
 
-    async def init_backend(self):
-        if self.backend == "fs":
-            self._backend = FsBackend()
-            await self._backend.start()
-            logger.debug(f"[k8s-metrix]: Initialized FsBackend.")
 
-    async def all_metrics(self) -> List[str]:
-        """
-        Retrieve all metrics from the backend.
-
-        Returns:
-            dict: A dictionary containing all metrics.
-        """
-        if isinstance(self._backend, FsBackend):
-            metrics = await self._backend.list_all_metrics()
-            logger.debug(f"[k8s-metrix]: Retrieved all metrics: {metrics}")
-            return metrics
-        else:
-            raise NotImplementedError("Backend not implemented.")
 
 
 def generate_private_key_and_csr(service_name: str, 

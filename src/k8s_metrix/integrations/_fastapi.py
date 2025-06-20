@@ -75,7 +75,7 @@ def configure(app: FastAPI, k8s_metrix: K8sMetrix) -> None:
         """
         Middleware to handle requests and responses.
         """
-        k8s_metrix.add_metric("request_count", 1)
+        await k8s_metrix.add_metric("requests", 1, metric_type="counter")
         response = await call_next(request)
         return response
     
